@@ -1,25 +1,150 @@
+/*
+ * PostponeUpgrade.js — RoomOS macro (v2)
+ *
+ * Keeps postponing cloud-pushed software upgrades on a RoomOS device.
+ * Written for a codec on RoomOS 11 with a Touch 10, which should not be
+ * moved to RoomOS 26. It is a stopgap while a Cisco TAC case is open,
+ * not a permanent fix.
+ *
+ * How it works
+ *   - Watches xStatus Provisioning Software UpgradeStatus for changes.
+ *   - Also polls that status on a timer, in case an event is missed.
+ *   - Postpones only when an upgrade is about to install (due within
+ *     TRIGGER_WITHIN_SECONDS, or in the "about to install" phase).
+ *     Postponing earlier could move a midnight upgrade closer, so it waits.
+ *   - Tries the longest postpone first and falls back to shorter values
+ *     if the device rejects one.
+ *   - A short cooldown stops it re-firing on its own status changes.
+ *
+ * v2: every asynchronous call is now caught, including the background
+ * status subscription, so the macro no longer throws
+ * "Unhandled promise rejection". Problems are logged with a clear message.
+ */
 import xapi from 'xapi';
 
-const POSTPONE_SECONDS = 21600; // 6 hours, same as the on-screen Postpone
+// ---------- Settings ----------
+const POSTPONE_OPTIONS_SECONDS = [21600, 14400, 7200, 3600, 1800, 900, 600]; // longest first
+const TRIGGER_WITHIN_SECONDS = 900;  // postpone when the upgrade is due within 15 minutes
+const POLL_INTERVAL_SECONDS = 30;    // safety-net check; the on-screen prompt only lasts 60 s
+const COOLDOWN_SECONDS = 20;         // ignore re-triggers right after a postpone
+const TRIGGER_PHASES = ['AboutToInstallUpgrade'];
+const LOG_PREFIX = '[PostponeUpgrade]';
+// ------------------------------
 
-async function postponeUpgrade(reason) {
+let lastAttempt = 0;
+let lastPhase;              // undefined until the first successful read
+let statusErrorLogged = false;
+
+function log(...args) { console.log(LOG_PREFIX, ...args); }
+function warn(...args) { console.warn(LOG_PREFIX, ...args); }
+
+// xAPI errors are often plain objects ({ code, message, data }) rather than Error instances.
+function errText(e) {
+  if (!e) return 'unknown error';
+  if (typeof e === 'string') return e;
+  if (e.message) return e.data ? `${e.message} ${JSON.stringify(e.data)}` : e.message;
+  try { return JSON.stringify(e); } catch (_) { return String(e); }
+}
+
+function looksLikeMissingCommand(e) {
+  return /unknown|not found|no match|invalid path|not available/i.test(errText(e));
+}
+
+async function getUpgradeStatus() {
   try {
-    await xapi.Command.Provisioning.PostponeUpgrade({ SecondsToPostpone: POSTPONE_SECONDS });
-    console.log(`Upgrade postponed (${reason})`);
+    const status = (await xapi.Status.Provisioning.Software.UpgradeStatus.get()) || {};
+    if (statusErrorLogged) {
+      log('Upgrade status readable again.');
+      statusErrorLogged = false;
+    }
+    return status;
   } catch (e) {
-    console.error('Postpone failed:', e.message);
+    if (!statusErrorLogged) {
+      warn('Could not read xStatus Provisioning Software UpgradeStatus:', errText(e),
+           '(will keep retrying quietly)');
+      statusErrorLogged = true;
+    }
+    return null;
   }
 }
 
-// React as soon as an upgrade gets scheduled
-xapi.Status.Provisioning.Software.UpgradeStatus.SecondsUntilUpgrade.on(value => {
-  if (parseInt(value, 10) > 0) postponeUpgrade('upgrade scheduled');
-});
-
-// Check on macro start, and every 30 minutes as a safety net
-async function check() {
-  const secs = await xapi.Status.Provisioning.Software.UpgradeStatus.SecondsUntilUpgrade.get();
-  if (parseInt(secs, 10) > 0) postponeUpgrade('periodic check');
+function reasonToPostpone(status) {
+  const phase = status.Phase;
+  const secs = parseInt(status.SecondsUntilUpgrade, 10);
+  if (phase && TRIGGER_PHASES.includes(phase)) return `phase is ${phase}`;
+  if (!Number.isNaN(secs) && secs > 0 && secs <= TRIGGER_WITHIN_SECONDS) {
+    return `upgrade due in ${secs}s`;
+  }
+  return null;
 }
-check();
-setInterval(check, 30 * 60 * 1000);
+
+async function postpone(reason) {
+  const now = Date.now();
+  if (now - lastAttempt < COOLDOWN_SECONDS * 1000) return false;
+  lastAttempt = now;
+
+  for (const seconds of POSTPONE_OPTIONS_SECONDS) {
+    try {
+      await xapi.Command.Provisioning.PostponeUpgrade({ SecondsToPostpone: seconds });
+      log(`Postponed upgrade by ${seconds}s (${reason}).`);
+      return true;
+    } catch (e) {
+      if (looksLikeMissingCommand(e)) {
+        warn('xCommand Provisioning PostponeUpgrade is not available on this device:', errText(e));
+        break;
+      }
+      warn(`Postpone of ${seconds}s rejected: ${errText(e)}`);
+    }
+  }
+  warn('Postpone failed. The upgrade may go ahead. Use the on-screen Postpone button if you can.');
+  lastAttempt = 0; // let the next check try again straight away
+  return false;
+}
+
+async function evaluate(source) {
+  const status = await getUpgradeStatus();
+  if (!status) return;
+
+  if (status.Phase !== lastPhase) {
+    log(`Upgrade phase: ${lastPhase === undefined ? '(start)' : (lastPhase || 'none')}`,
+        `-> ${status.Phase || 'none'}`,
+        `| target: ${status.VersionId || 'n/a'}`,
+        `| urgency: ${status.Urgency || 'n/a'}`,
+        `| seconds until upgrade: ${status.SecondsUntilUpgrade || 'n/a'}`);
+    lastPhase = status.Phase;
+  }
+
+  const reason = reasonToPostpone(status);
+  if (reason) await postpone(`${reason}, via ${source}`);
+}
+
+// Runs a check and makes sure nothing escapes as an unhandled rejection.
+function runCheck(source) {
+  try {
+    evaluate(source).catch(e => warn(`Check (${source}) failed:`, errText(e)));
+  } catch (e) {
+    warn(`Check (${source}) failed:`, errText(e));
+  }
+}
+
+function subscribe() {
+  try {
+    const off = xapi.Status.Provisioning.Software.UpgradeStatus.on(() => runCheck('status event'));
+    // The subscription is registered in the background; catch it if the device refuses it.
+    const registration = off && off.registration;
+    if (registration && typeof registration.catch === 'function') {
+      registration.catch(e => warn('Status subscription refused; relying on polling only:', errText(e)));
+    }
+  } catch (e) {
+    warn('Could not subscribe to UpgradeStatus; relying on polling only:', errText(e));
+  }
+}
+
+function start() {
+  log('Started. Watching for cloud upgrades.');
+  subscribe();
+  runCheck('startup');
+  setInterval(() => runCheck('poll'), POLL_INTERVAL_SECONDS * 1000);
+}
+
+start();
