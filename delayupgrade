@@ -1,0 +1,25 @@
+import xapi from 'xapi';
+
+const POSTPONE_SECONDS = 21600; // 6 hours, same as the on-screen Postpone
+
+async function postponeUpgrade(reason) {
+  try {
+    await xapi.Command.Provisioning.PostponeUpgrade({ SecondsToPostpone: POSTPONE_SECONDS });
+    console.log(`Upgrade postponed (${reason})`);
+  } catch (e) {
+    console.error('Postpone failed:', e.message);
+  }
+}
+
+// React as soon as an upgrade gets scheduled
+xapi.Status.Provisioning.Software.UpgradeStatus.SecondsUntilUpgrade.on(value => {
+  if (parseInt(value, 10) > 0) postponeUpgrade('upgrade scheduled');
+});
+
+// Check on macro start, and every 30 minutes as a safety net
+async function check() {
+  const secs = await xapi.Status.Provisioning.Software.UpgradeStatus.SecondsUntilUpgrade.get();
+  if (parseInt(secs, 10) > 0) postponeUpgrade('periodic check');
+}
+check();
+setInterval(check, 30 * 60 * 1000);
